@@ -4,8 +4,8 @@
 |---|---|
 | **Status** | Draft — design review welcome |
 | **Related issue** | #127 (*AIOS Semantic Scheduling* → *Priority-based Agent-level Scheduling*) |
-| **Tracking issue** | `<FILL IN> ` |
-| **Authors** | Group 5 — university operating systems course project |
+| **Tracking issue** | `#554 ` |
+| **Authors** | Group of 5 — university operating systems course project |
 | **Scope** | `aios/scheduler/`, `aios/hooks/types/`, `runtime/launch.py`, `aios/config/`, `tests/` |
 
 ---
