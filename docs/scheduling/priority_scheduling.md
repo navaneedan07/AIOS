@@ -68,6 +68,9 @@ unassigned and unimplemented.
 The `priority` field and the config surface were evidently anticipated by the existing
 design; the policy itself was never implemented.
 
+*This table describes `main` before the change — it is what motivates the work, not a
+description of this branch. See §5.2 for what is implemented here.*
+
 ---
 
 ## 4. Goals and non-goals
@@ -128,12 +131,44 @@ of draining the queue in arrival order — builds a batch using its policy decis
 
 ### 5.2 Components
 
-**`SchedulerRegistry`** (`aios/scheduler/registry.py`, new)
-Maps a policy name to its class: `fcfs`, `round_robin`, `priority`, `fair_share`. Adding a
+Sections below are marked **done** when they are implemented and tested in the current
+branch, and **planned** when they are follow-up work from the task checklist.
+
+**`SchedulerRegistry`** (`aios/scheduler/registry.py`, new) — **done**
+Maps a policy name to its class: `fifo` (alias `fcfs`), `round_robin`, `priority`. Adding a
 future policy becomes a one-line registration. This is the policy/mechanism split: the
 dispatch machinery stays fixed while the rule becomes pluggable.
 
-**`AgentLedger`** (`aios/scheduler/accounting.py`, new)
+The registry is also the only place that knows which option keys each policy accepts, so an
+option belonging to a different policy is ignored rather than passed to a constructor that
+cannot accept it. An unknown policy name raises at start-up rather than silently falling
+back to FIFO — an operator who believes a policy is active when it is not is worse off than
+one whose kernel refuses to start.
+
+**`PriorityPolicy`** (`aios/scheduler/priority_policy.py`, new) — **done**
+The decision logic only: levels, the aging formula, the selection rule and the starvation
+bound. It imports nothing from AIOS, so it can be unit-tested and benchmarked without
+`cerebrum`, a model backend or a running server, and a future `aios-rs` port can mirror it
+without inheriting the Python kernel's dependency graph.
+
+**`PriorityScheduler`** (`aios/scheduler/priority_scheduler.py`, new) — **done**
+The thin adapter that feeds real `aios.syscall.Syscall` objects into the policy and connects
+it to the kernel's threads, queues and syscall lifecycle.
+
+**`SchedulerManager`** (`aios/scheduler/manager.py`, new) — **done**
+Owns the live scheduler, so the policy can change while the kernel is running instead of
+only at start-up. All four request queues are module-level globals, which is what makes a
+swap possible: a new scheduler instance reads the same queues. What is *not* shared is a
+scheduler's own state — a `PriorityScheduler` holds requests it has already accepted in a
+ready set, and each of those is a thread blocked on `syscall.join()`. So the swap is
+ordered: construct the new scheduler first (a bad policy name or option is then rejected
+while the running one is untouched), stop the old one and let its threads exit, hand any
+accepted-but-undispatched requests back to the request queue, then start the new one.
+
+This is the part of the design most likely to be got wrong, so it has the most pointed
+test: `test_switch_requeues_requests_that_were_accepted_but_not_dispatched`.
+
+**`AgentLedger`** (`aios/scheduler/accounting.py`, planned)
 The per-agent record that makes fairness possible. Agents are identified by
 `syscall.agent_name`, which AIOS already uses as the agent identity throughout the syscall
 path.
@@ -155,7 +190,7 @@ class AgentRecord:
 The ledger is guarded by a single lock; it is small, and fairness is impossible without a
 consistent view of it.
 
-**`MetricsCollector`** (`aios/utils/metrics.py`, new)
+**`MetricsCollector`** (`aios/utils/metrics.py`, planned)
 Aggregates per-agent waiting/turnaround and computes a **Jain fairness index** over
 normalized dispatches:
 
@@ -167,9 +202,13 @@ J = (Σ xᵢ)² / (n · Σ xᵢ²)        xᵢ = dispatched_i / weight_i
 
 ### 5.3 Policies
 
-#### `priority` — priority with aging
+#### `priority` — priority with aging — **done**
 
 Each queued request carries a base level from `priority` (`high=0, normal=1, low=2`).
+Levels are normalised from whatever the caller supplied, so `PriorityLevel.HIGH`,
+`"high"`, `"URGENT"` and `0` all resolve to HIGH, an unrecognised value falls back to
+`default_priority`, and an out-of-range integer is clamped rather than rejected — a
+malformed priority from a caller must not take the kernel down.
 
 ```
 effective_level(r) = max(0, r.base_level - r.wait_ticks // aging_interval)
@@ -187,7 +226,7 @@ Ticks are scheduling rounds, not wall-clock seconds, which keeps the bound indep
 how slow an individual LLM call happens to be. This bound is a testable property, and the
 test suite asserts it.
 
-#### `fair_share` — weighted fair queueing with virtual time (stride scheduling)
+#### `fair_share` — weighted fair queueing with virtual time (stride scheduling) — **planned**
 
 Standard stride scheduling: agent `i` has weight `wᵢ`; each dispatch advances its virtual
 time by the inverse of its weight, and the agent with the smallest virtual time runs next.
@@ -218,18 +257,28 @@ test asserts this.
 ```yaml
 scheduler:
   log_mode: "console"
-  policy: "fcfs"            # fcfs | round_robin | priority | fair_share  (default: fcfs)
-  batch_interval: 1.0       # seconds between scheduling rounds
-  aging_interval: 5         # ticks before a waiting request escalates one level
-  default_priority: "normal" # high | normal | low
-  fair_share:
-    default_weight: 1
-    agents:                 # optional per-agent weights
-      research_agent: 3
-      chat_agent: 1
+
+  # Which agent gets the LLM next: fifo | round_robin | priority  (default: fifo)
+  policy: "priority"
+
+  # Options for one policy live under that policy's own key. Only the keys the
+  # selected policy declares are read, so a stale key left over from another
+  # policy cannot break start-up.
+  fifo:
+    batch_interval: 1.0        # seconds between scheduling rounds
+  round_robin:
+    time_slice: 1.0            # per-round time slice in seconds
+  priority:
+    aging_interval: 5          # dispatch rounds to gain one priority level
+    default_priority: "normal" # used when a syscall carries no priority
 ```
 
-Defaults reproduce today's behaviour exactly, so an existing `config.yaml` is unaffected.
+`batch_interval` and `time_slice` were hard-coded constants before this change; they are now
+read from configuration with their previous values as defaults, so the change is additive.
+
+Naming no policy reproduces today's behaviour exactly: `round_robin` when
+`llms.use_context_manager` is true (context switching is implemented by `RRScheduler`),
+otherwise `fifo`. An existing `config.yaml` is therefore unaffected.
 
 ### 5.5 Compatibility and rollout
 
@@ -245,16 +294,99 @@ Defaults reproduce today's behaviour exactly, so an existing `config.yaml` is un
 
 | File | Change |
 |---|---|
-| `aios/scheduler/registry.py` | **New** — policy name → class registry |
-| `aios/scheduler/accounting.py` | **New** — `AgentLedger`, `AgentRecord` |
-| `aios/scheduler/priority_scheduler.py` | **New** — priority policy with aging |
-| `aios/scheduler/fair_share_scheduler.py` | **New** — stride-based fair-share policy |
-| `aios/utils/metrics.py` | **New** — fairness index and per-agent reporting |
-| `aios/hooks/types/scheduler.py` | Extend `SchedulerParams` with the new fields |
-| `runtime/launch.py` | Select the policy from config via the registry |
-| `aios/config/config.yaml.example` | Document the new keys |
+| `aios/scheduler/registry.py` | **New** — policy name → class registry, config resolution |
+| `aios/scheduler/priority_policy.py` | **New** — levels, aging, selection, starvation bound (no AIOS imports) |
+| `aios/scheduler/priority_scheduler.py` | **New** — `PriorityScheduler`, the `BaseScheduler` adapter |
+| `runtime/launch.py` | Select the policy from config via the registry; accept a per-request `priority` |
+| `aios/syscall/syscall.py` | Carry the requested priority onto the syscall; arrival line shows it |
+| `aios/config/config.yaml.example` | Document `policy` and the per-policy option blocks |
+| `aios/scheduler/manager.py` | **New** — owns the live scheduler; runtime policy switching |
+| `scripts/run_kernel.sh` | **New** — start the kernel with the environment it needs |
+| `scripts/agent_tab.py` | **New** — one interactive agent tab per terminal |
+| `aios/terminal/terminal.py` | **New** — the AIOS terminal, with per-tab `--priority` / `--model` / `--name` |
+| `aios/terminal/tab_client.py` | **New** — backend → priority table, and the priority-carrying request payload |
+| `runtime/run_terminal.py`, `scripts/run_terminal.py` | Thin entry points for the terminal above (they were near-identical copies) |
+| `scripts/set_policy.py` | **New** — show or change the policy of a running kernel |
+| `scripts/verify_policy.py` | **New** — check the reported policy is the one actually followed |
 | `tests/modules/scheduler/` | **New** — unit, property and regression tests |
 | `docs/scheduling/priority_scheduling.md` | **This document** |
+
+Planned, not yet added: `aios/scheduler/accounting.py`, `aios/scheduler/fair_share_scheduler.py`,
+`aios/utils/metrics.py`.
+
+### 5.7 Getting a priority to the scheduler — **done**
+
+The `priority` field has existed on every syscall from the start but never had a writer.
+A client sets it by sending a top-level `priority` on `POST /query`:
+
+1. `QueryRequest` accepts `priority` (`"high"` / `"normal"` / `"low"`, or a level).
+2. The request handler attaches it to the query object as `query._request_priority` — a
+   private attribute, the same mechanism the handler already uses for `user_id`, so the
+   Cerebrum SDK query types stay unmodified.
+3. `SyscallExecutor._execute_syscall` reads it back and calls `syscall.set_priority(...)` on
+   each syscall it creates, which is what the policy reads via `syscall.get_priority()`.
+
+A request that sends no priority leaves the field at `None` and the policy applies
+`default_priority`, so the change is inert for every existing client and for the `fifo` and
+`round_robin` policies.
+
+### 5.8 Watching it live — **done**
+
+**The allocation log.** Every scheduling decision prints one coloured line to the kernel
+terminal, so the ready set can be seen being ordered in real time:
+
+```
+QUEUED   22:09:38  metrics_agent (normal)  queue=1
+QUEUED   22:09:38  chat_agent (high)  queue=2
+RUN      22:09:38  chat_agent (high)  waited 0.1s / 0 rounds  effective=high
+DONE     22:09:39  chat_agent  took 1.1s  thread=3
+READY    22:09:39  next -> metrics_agent(normal,waited 0)
+```
+
+The `READY` line is the policy made visible: the queue is printed already sorted, with the
+aged level of every request, so a low-priority request climbing toward the front can be
+watched.
+
+`RUN` reports both wall-clock seconds and dispatch rounds. The two differ by design: rounds
+drive aging, seconds are what a caller experiences. A request that spent 20 s behind a
+single long generation has aged by zero rounds, which is correct — it was never passed
+over, the backend was simply busy.
+
+Arrival is printed by the syscall executor the moment a request is queued, before the
+scheduler picks anything up, so a message typed in a tab is acknowledged immediately even
+while the LLM is busy with another agent.
+
+**The tab client.** `scripts/agent_tab.py` is one interactive agent per terminal. Open four
+tabs with different `--priority` values, type a message in each, and the kernel terminal
+shows which one was chosen and what it waited behind. `scripts/run_kernel.sh` starts the
+kernel with the environment it needs.
+
+AIOS's own terminal carries both as well. `aios/terminal/terminal.py` — entered through
+`runtime/run_terminal.py` or `scripts/run_terminal.py` — takes `--name` for identity,
+`--model` for the backend, and `--priority` for the level, defaulting the level to the
+tab's backend: `ollama` high, `gemini` normal, `groq` low. `/priority`, `/model` and
+`/name` change any of them without restarting the tab. Under `fifo` and `round_robin` the
+`priority` field is accepted and ignored, which is what lets the same four tabs serve as
+the comparison rather than as a special case.
+
+**Changing policy without restarting.** Starting the kernel takes about 80 seconds, which
+is too slow to compare policies on stage. The manager is exposed as:
+
+```
+GET  /core/scheduler          -> policy, class, options, dispatches so far, alternatives
+POST /core/scheduler/policy   -> {"policy": "priority", "options": {"aging_interval": 3}}
+```
+
+and as `scripts/set_policy.py`. The `GET` also answers "which policy is actually running?"
+for a kernel that is already up, which otherwise could only be inferred from start-up output
+or from the class name prefixed onto each log line.
+
+**Checking it is really in effect.** `scripts/verify_policy.py` separates the two things
+that matter: *identity* comes from `GET /core/scheduler`, and *behaviour* comes from
+submitting a LOW and a HIGH request at the same instant and seeing which reply lands first.
+A policy can be selected while the priority is ignored, and the identity check alone would
+not notice. The check also makes `fifo`'s limit concrete: it merges the pair into one model
+call, so both finish together and priority makes no latency difference at all.
 
 ---
 
@@ -320,14 +452,19 @@ measured evaluation. MLFQ is a natural additional policy behind the same registr
 
 ```
 [x] Design document
-[ ] SchedulerRegistry + config plumbing
+[x] SchedulerRegistry + config plumbing
+[x] Priority policy with aging
+[x] Priority reaches the scheduler from a client request
+[x] Tests: ordering, tie-breaking, aging progression
+[x] Property test: starvation bound
+[x] Command-line comparison harness (demo_priority_scheduling.py)
+[x] Live end-to-end demo against a running kernel (agent_tab.py, run_terminal.py)
+[x] Report the active policy of a running kernel (GET /core/scheduler)
+[x] Change policy at runtime without dropping queued requests
 [ ] AgentLedger
-[ ] Priority policy with aging
-[ ] Property test: starvation bound
 [ ] Fair-share policy (stride)
 [ ] Property test: share adherence
 [ ] Metrics + fairness score reporting
 [ ] Regression test: fcfs unchanged
-[ ] Benchmark harness (scripted workloads)
 [ ] Evaluation write-up
 ```
