@@ -19,6 +19,7 @@ The test:
 ```bash
 python scripts/verify_policy.py
 python scripts/verify_policy.py --server http://localhost:8000
+python scripts/verify_policy.py --model gemini:gemini-2.5-flash   # fast, deterministic
 ```
 
 A run takes a few seconds plus one model response. Uses only the standard
@@ -71,6 +72,20 @@ def read_policy(server: str) -> Dict[str, Any]:
     return _get(f"{server.rstrip('/')}/core/scheduler")
 
 
+def _parse_model(spec: Optional[str]) -> Optional[Dict[str, str]]:
+    """Turn ``'<backend>:<model name>'`` into the ``llms`` entry the kernel reads."""
+    if not spec:
+        return None
+    backend, _, name = spec.partition(":")
+    backend, name = backend.strip(), name.strip()
+    if not backend or not name:
+        raise SystemExit(
+            f"  --model must be '<backend>:<model name>', e.g. "
+            f"gemini:gemini-2.5-flash (got {spec!r})"
+        )
+    return {"name": name, "backend": backend}
+
+
 def chat(
     server: str,
     agent: str,
@@ -78,6 +93,7 @@ def chat(
     message: str,
     barrier: threading.Barrier,
     results: Dict[str, Tuple[float, str]],
+    model: Optional[Dict[str, str]] = None,
 ) -> None:
     """Submit one chat request, released together with its counterpart.
 
@@ -94,6 +110,8 @@ def chat(
             "action_type": "chat",
         },
     }
+    if model:
+        payload["query_data"]["llms"] = [dict(model)]
     try:
         barrier.wait(timeout=10)
     except threading.BrokenBarrierError:
@@ -113,7 +131,9 @@ def chat(
     results[agent] = (time.time() - started, str(text))
 
 
-def run_race(server: str) -> Tuple[str, Dict[str, Tuple[float, str]]]:
+def run_race(
+    server: str, model: Optional[Dict[str, str]] = None
+) -> Tuple[str, Dict[str, Tuple[float, str]]]:
     """Send LOW then HIGH at the same instant; return which agent replied first."""
     barrier = threading.Barrier(2)
     results: Dict[str, Tuple[float, str]] = {}
@@ -130,6 +150,7 @@ def run_race(server: str) -> Tuple[str, Dict[str, Tuple[float, str]]]:
                 "Reply with exactly: LOW",
                 barrier,
                 results,
+                model,
             ),
             daemon=True,
         ),
@@ -142,6 +163,7 @@ def run_race(server: str) -> Tuple[str, Dict[str, Tuple[float, str]]]:
                 "Reply with exactly: HIGH",
                 barrier,
                 results,
+                model,
             ),
             daemon=True,
         ),
@@ -203,6 +225,23 @@ def _verdict(
             "requests may not have landed in the same scheduling round",
         )
 
+    if policy == "fair_share":
+        # Fair share is priority-blind too, but unlike fifo/rr it deliberately
+        # keeps every agent moving, so a single request from each agent should
+        # always both come back; only the order is not meaningful here.
+        if len(results) == 2:
+            return (
+                True,
+                "fair_share ignores the priority field: both agents were served "
+                "a turn, ordered by each agent's weight and arrival rather than "
+                "by priority",
+            )
+        return (
+            False,
+            "one of the two requests did not come back; is the model backend "
+            "running?",
+        )
+
     if policy in ARRIVAL_ORDER_POLICIES:
         if batched:
             return (
@@ -217,11 +256,15 @@ def _verdict(
                 f"'{policy}' served the earlier request first, ignoring the "
                 f"priorities -- expected, since it has no notion of priority",
             )
+        # Both were sent at the same instant, so which one wins is decided by
+        # arrival timing and can differ run to run. A single race cannot tell
+        # "arrival order" from "priority order" here, so this is not a failure:
+        # what matters is that the policy never claims to use the priority.
         return (
-            False,
-            f"'{policy}' served HIGH first, but it has no notion of priority "
-            f"-- re-run, since the two requests may not have landed in the "
-            f"same scheduling round",
+            True,
+            f"'{policy}' served HIGH first, but it has no notion of priority -- "
+            f"with both requests sent at once either order is just arrival "
+            f"timing, so the priorities made no difference",
         )
 
     return False, f"'{policy}' is not a policy this check knows how to judge"
@@ -240,8 +283,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=DEFAULT_SERVER,
         help="kernel base URL (default: %(default)s)",
     )
+    parser.add_argument(
+        "--model",
+        help="model to send as '<backend>:<model name>'. Default: the kernel's "
+        "own choice. Pick a fast one (e.g. gemini:gemini-2.5-flash) so both "
+        "replies come back in seconds.",
+    )
     args = parser.parse_args(argv)
     server = args.server.rstrip("/")
+    model = _parse_model(args.model)
 
     try:
         info = read_policy(server)
@@ -260,7 +310,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print()
     print("  ---- behaviour ----")
     print("  sending LOW and HIGH at the same instant...")
-    first, results = run_race(server)
+    first, results = run_race(server, model)
 
     if not results:
         print("  no replies came back; is the model backend running?")

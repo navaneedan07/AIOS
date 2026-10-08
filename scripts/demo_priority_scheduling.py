@@ -75,8 +75,18 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
+# The schedulers import cerebrum transitively; run under the project venv even
+# when invoked with a global ``python``.
+try:
+    from _bootstrap import ensure_project_interpreter
+except ImportError:  # imported as ``scripts.demo_priority_scheduling``
+    from scripts._bootstrap import ensure_project_interpreter
+
+ensure_project_interpreter()
+
 from aios.scheduler.priority_policy import PriorityLevel
 from aios.scheduler.registry import (
+    POLICY_FAIR_SHARE,
     POLICY_FIFO,
     POLICY_PRIORITY,
     POLICY_ROUND_ROBIN,
@@ -90,6 +100,7 @@ DEMO_POLICIES: Tuple[str, ...] = (
     POLICY_FIFO,
     POLICY_ROUND_ROBIN,
     POLICY_PRIORITY,
+    POLICY_FAIR_SHARE,
 )
 
 #: The configuration the demo starts from -- the same keys as config.yaml.
@@ -102,6 +113,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "fifo": {"batch_interval": 0.01},
     "round_robin": {"time_slice": 1.0},
     "priority": {"aging_interval": 5, "default_priority": "normal"},
+    "fair_share": {"default_weight": 1.0, "poll_interval": 0.01},
 }
 
 #: An aging interval large enough that no request ages within a run.
@@ -154,12 +166,18 @@ class DemoSyscall:
         self.priority = work.priority
         self.status: Optional[str] = None
         self.response: Any = None
+        self.created_time: Optional[float] = None
         self.start_time: Optional[float] = None
         self.end_time: Optional[float] = None
         self.event = Event()
 
     def get_priority(self):
         return self.priority
+
+    def get_created_time(self):
+        # The real syscall records when it was enqueued; the harness only needs
+        # the attribute to exist, so real wait times are not reported here.
+        return self.created_time
 
     def set_priority(self, value):
         self.priority = value
@@ -172,6 +190,9 @@ class DemoSyscall:
 
     def set_start_time(self, value):
         self.start_time = value
+
+    def get_start_time(self):
+        return self.start_time
 
     def set_end_time(self, value):
         self.end_time = value
@@ -204,7 +225,15 @@ class WorkProbe:
         if self.scheduler is None:
             return False
         snapshot = getattr(self.scheduler, "ready_snapshot", None)
-        return bool(snapshot()) if callable(snapshot) else False
+        if callable(snapshot):
+            return bool(snapshot())
+        # The fair-share scheduler keeps its ready set in a core object rather
+        # than exposing a snapshot, so ask that instead.
+        core = getattr(self.scheduler, "core", None)
+        has_waiting = getattr(core, "has_waiting", None)
+        if callable(has_waiting):
+            return bool(has_waiting())
+        return False
 
 
 class SimulatedClock:
@@ -668,11 +697,14 @@ def render_run(result: RunResult, width: int = 74) -> str:
             f"largest ready set={result.timing.max_ready}"
         )
     else:
-        reason = (
-            "dispatches a whole batch at once, so there is no per-request decision"
-            if result.policy == POLICY_FIFO
-            else "takes the head of the queue, so there is no decision step to time"
-        )
+        if result.policy == POLICY_FIFO:
+            reason = (
+                "dispatches a whole batch at once, so there is no per-request decision"
+            )
+        elif result.policy == POLICY_FAIR_SHARE:
+            reason = "selects by stride inside FairShareScheduler.core"
+        else:
+            reason = "takes the head of the queue, so there is no decision step to time"
         lines.append(f"  scheduler overhead: n/a - this policy {reason}")
     return "\n".join(lines)
 
@@ -888,7 +920,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("AIOS scheduling demo - policy selected by name from configuration")
     print(f"  config source: {source}")
     print("  scheduler section used by this run:")
-    for key in ("policy", "fifo", "round_robin", "priority"):
+    for key in ("policy", "fifo", "round_robin", "priority", "fair_share"):
         if key in config:
             marker = "   <-- flip this to switch policy" if key == "policy" else ""
             print(f"      scheduler.{key}: {config[key]}{marker}")

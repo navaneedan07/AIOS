@@ -21,6 +21,16 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+# The terminal imports cerebrum; running this with a global ``python`` that
+# lacks it fails deep in the import chain. Prefer the project virtualenv, the
+# same way the kernel launchers do.
+try:
+    from _bootstrap import ensure_project_interpreter
+except ImportError:  # imported as ``scripts.run_terminal``
+    from scripts._bootstrap import ensure_project_interpreter
+
+ensure_project_interpreter()
+
 from aios.terminal.terminal import AIOSTerminal, main  # noqa: E402,F401
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
 # Open the four terminal tabs of the scheduling demo, one window each.
 #
-# Each tab is an independent agent submitting to its own backend, and its
-# priority follows that backend: ollama -> high, gemini -> normal, groq -> low.
-# The fourth tab pins a priority explicitly, to show that an explicit choice
-# wins over the backend default.
+# Each tab is an independent agent submitting to a *different* model, so the
+# kernel log shows four distinct agents rather than four identical ones, and
+# the priorities span all three levels.
+#
+# The two hosted models respond in a second or two; the two local Ollama models
+# take longer, which is what makes queuing visible: type into a local (low)
+# tab, then into the Gemini (high) tab, and under `priority` the Gemini reply
+# comes back while the local request is still generating.
 #
 # Start the kernel first, in its own window:
 #   .\scripts\run_kernel.ps1
@@ -31,11 +35,12 @@ if (Test-Path $VenvPython) {
 }
 
 # name, model, priority ("" = derived from the model's backend)
+# Four different models: two hosted (Gemini, Groq) and two local (Ollama).
 $Tabs = @(
-    @{ Name = "ollama_tab"; Model = "ollama"; Priority = "" },
-    @{ Name = "gemini_tab"; Model = "gemini"; Priority = "" },
-    @{ Name = "groq_tab";   Model = "groq";   Priority = "" },
-    @{ Name = "urgent_tab"; Model = "gemini"; Priority = "high" }
+    @{ Name = "gemini_tab"; Model = "gemini:gemini-2.5-flash";  Priority = "high" },
+    @{ Name = "groq_tab";   Model = "groq:openai/gpt-oss-20b";  Priority = "normal" },
+    @{ Name = "gemma_tab";  Model = "ollama:gemma3:1b";         Priority = "low" },
+    @{ Name = "qwen_tab";   Model = "ollama:qwen2:0.5b";        Priority = "low" }
 )
 
 foreach ($Tab in $Tabs) {
