@@ -132,6 +132,19 @@ class StrideFairShareCore:
     def weights(self) -> Dict[Hashable, float]:
         return {aid: s.weight for aid, s in self._agents.items()}
 
+    def drain(self) -> List[object]:
+        """Remove and return every queued request, emptying the wait lists.
+
+        Used when the scheduler is replaced at runtime: requests it has
+        accepted off the request queue are threads blocked on their event, so
+        they have to be handed back rather than dropped.
+        """
+        pending: List[object] = []
+        for queue in self._waiting.values():
+            pending.extend(request for _, request in queue)
+            queue.clear()
+        return pending
+
 
 try:
     # Deferred until here (rather than a top-level import) because
@@ -190,6 +203,7 @@ if BaseScheduler is not None:
             )
             self.core = StrideFairShareCore(default_weight=default_weight)
             self.poll_interval = poll_interval
+            self._dispatched = 0
 
         def _execute_syscall(self, syscall: Any, executor: Any, syscall_type: str) -> Optional[Dict[str, Any]]:
         
@@ -231,6 +245,52 @@ if BaseScheduler is not None:
                 weight = getattr(syscall, "agent_weight", None)
                 self.core.enqueue(agent_id, syscall, weight=weight)
 
+        def _dispatch_llm_syscall(self, syscall: Any) -> None:
+            """Execute one LLM syscall through the adapter.
+
+            ``LLMAdapter`` exposes its LLM entry point as
+            ``execute_llm_syscalls`` (plural, taking a list), the same call the
+            FIFO, round-robin and priority policies make. The adapter owns the
+            rest of the syscall lifecycle -- response, status, ``end_time`` and
+            the event that unblocks the calling agent -- so on failure the
+            failure is published here instead, and a waiting agent is never
+            left blocked.
+            """
+            try:
+                syscall.set_status("executing")
+                self.logger.log(
+                    f"{syscall.agent_name} is executing LLM syscall.\n",
+                    "executing",
+                )
+                syscall.set_start_time(time.time())
+
+                self.llm.execute_llm_syscalls([syscall])
+                self._dispatched += 1
+
+                self.logger.log(
+                    f"Completed LLM syscall for {syscall.agent_name}. "
+                    f"Thread ID: {syscall.get_pid()}\n",
+                    "done",
+                )
+            except Exception as error:
+                logger.error("Error executing LLM syscall: %s", error)
+                traceback.print_exc()
+                try:
+                    syscall.set_status("error")
+                    syscall.set_end_time(time.time())
+                    syscall.event.set()
+                except Exception:
+                    logger.error("Could not publish failure for %s", syscall)
+
+        @property
+        def dispatched_count(self) -> int:
+            """Number of LLM syscalls this scheduler has dispatched."""
+            return self._dispatched
+
+        def drain_pending_syscalls(self) -> List[Any]:
+            """Return every accepted request still waiting to be dispatched."""
+            return self.core.drain()
+
         def process_llm_requests(self) -> None:
         
             while self.active:
@@ -239,8 +299,8 @@ if BaseScheduler is not None:
                 if selected is None:
                     time.sleep(self.poll_interval)
                     continue
-                agent_id, syscall = selected
-                self._execute_syscall(syscall, self.llm.execute_llm_syscall, "LLM")
+                _agent_id, syscall = selected
+                self._dispatch_llm_syscall(syscall)
 
         def process_memory_requests(self) -> None:
             while self.active:

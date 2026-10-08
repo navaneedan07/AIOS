@@ -17,6 +17,7 @@ import pytest
 
 from aios.scheduler.registry import (
     DEFAULT_POLICY,
+    POLICY_FAIR_SHARE,
     POLICY_FIFO,
     POLICY_PRIORITY,
     POLICY_ROUND_ROBIN,
@@ -33,7 +34,12 @@ from aios.scheduler.registry import (
 # ----------------------------------------------------------------------
 def test_available_policies_lists_every_selectable_policy():
     assert available_policies() == SUPPORTED_POLICIES
-    assert set(SUPPORTED_POLICIES) == {POLICY_FIFO, POLICY_ROUND_ROBIN, POLICY_PRIORITY}
+    assert set(SUPPORTED_POLICIES) == {
+        POLICY_FIFO,
+        POLICY_ROUND_ROBIN,
+        POLICY_PRIORITY,
+        POLICY_FAIR_SHARE,
+    }
 
 
 def test_default_policy_is_fifo():
@@ -85,6 +91,11 @@ def test_an_explicit_policy_wins_over_context_management():
         ("priority", POLICY_PRIORITY),
         ("PRIORITY", POLICY_PRIORITY),
         ("prio", POLICY_PRIORITY),
+        ("fair_share", POLICY_FAIR_SHARE),
+        ("fairshare", POLICY_FAIR_SHARE),
+        ("fair", POLICY_FAIR_SHARE),
+        ("stride", POLICY_FAIR_SHARE),
+        ("fs", POLICY_FAIR_SHARE),
     ],
 )
 def test_policy_names_are_normalised(value, expected):
@@ -128,6 +139,11 @@ def test_priority_options_are_read_from_the_priority_section():
         (POLICY_FIFO, {"batch_interval": 0.1}, {"batch_interval": 0.1}),
         (POLICY_ROUND_ROBIN, {"time_slice": 2}, {"time_slice": 2}),
         (POLICY_PRIORITY, {"aging_interval": 10}, {"aging_interval": 10}),
+        (
+            POLICY_FAIR_SHARE,
+            {"default_weight": 2.0, "poll_interval": 0.1},
+            {"default_weight": 2.0, "poll_interval": 0.1},
+        ),
     ],
 )
 def test_each_policy_reads_its_own_options(policy, section, expected):

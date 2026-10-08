@@ -10,6 +10,7 @@ python scripts/set_policy.py priority              # switch to it
 python scripts/set_policy.py fifo
 python scripts/set_policy.py priority --aging-interval 3
 python scripts/set_policy.py round_robin --time-slice 0.5
+python scripts/set_policy.py fair_share --default-weight 1.0
 ```
 
 Requests that were accepted but not yet dispatched are carried over to the new
@@ -95,6 +96,8 @@ def build_options(args: argparse.Namespace) -> Dict[str, Any]:
         "default_priority": args.default_priority,
         "batch_interval": args.batch_interval,
         "time_slice": args.time_slice,
+        "default_weight": args.default_weight,
+        "poll_interval": args.poll_interval,
     }
     return {key: value for key, value in supplied.items() if value is not None}
 
@@ -112,15 +115,18 @@ def build_parser() -> argparse.ArgumentParser:
             "  set_policy.py                        # what is running now\n"
             "  set_policy.py priority\n"
             "  set_policy.py fifo\n"
+            "  set_policy.py round_robin\n"
+            "  set_policy.py fair_share\n"
             "  set_policy.py priority --aging-interval 3\n"
             "  set_policy.py round_robin --time-slice 0.5\n"
+            "  set_policy.py fair_share --default-weight 2.0\n"
         ),
     )
     parser.add_argument(
         "policy",
         nargs="?",
         help="policy to switch to: fifo (alias fcfs), round_robin (alias rr), "
-        "priority. Omit to just show the current one.",
+        "priority, fair_share (alias stride). Omit to just show the current one.",
     )
     parser.add_argument(
         "--aging-interval",
@@ -141,6 +147,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--time-slice",
         type=float,
         help="round_robin policy: seconds each request gets before moving on",
+    )
+    parser.add_argument(
+        "--default-weight",
+        type=float,
+        help="fair_share policy: weight given to an agent that declares none",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        help="fair_share policy: seconds to sleep when no request is ready",
     )
     parser.add_argument(
         "--server",

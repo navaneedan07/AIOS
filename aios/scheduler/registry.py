@@ -5,7 +5,7 @@ This module is the single place that turns the ``scheduler`` section of
 
     scheduler:
       log_mode: "console"     # choose from [console, file]
-      policy: "priority"      # choose from [fifo, round_robin, priority]
+      policy: "priority"      # choose from [fifo, round_robin, priority, fair_share]
 
       # Options for the policy above; only the keys the policy declares are read.
       fifo:
@@ -15,6 +15,9 @@ This module is the single place that turns the ``scheduler`` section of
       priority:
         aging_interval: 5
         default_priority: "normal"
+      fair_share:
+        default_weight: 1.0
+        poll_interval: 0.05
 
 Two things motivated it:
 
@@ -38,6 +41,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 POLICY_FIFO = "fifo"
 POLICY_ROUND_ROBIN = "round_robin"
 POLICY_PRIORITY = "priority"
+POLICY_FAIR_SHARE = "fair_share"
 
 #: Policy used when ``scheduler.policy`` is absent and context management is off.
 DEFAULT_POLICY = POLICY_FIFO
@@ -47,6 +51,7 @@ SUPPORTED_POLICIES: Tuple[str, ...] = (
     POLICY_FIFO,
     POLICY_ROUND_ROBIN,
     POLICY_PRIORITY,
+    POLICY_FAIR_SHARE,
 )
 
 #: Alternative spellings accepted in configuration, all case-insensitive.
@@ -59,6 +64,11 @@ _POLICY_ALIASES: Dict[str, str] = {
     "rr": POLICY_ROUND_ROBIN,
     "priority": POLICY_PRIORITY,
     "prio": POLICY_PRIORITY,
+    "fair_share": POLICY_FAIR_SHARE,
+    "fairshare": POLICY_FAIR_SHARE,
+    "fair": POLICY_FAIR_SHARE,
+    "stride": POLICY_FAIR_SHARE,
+    "fs": POLICY_FAIR_SHARE,
 }
 
 #: Per-policy constructor arguments that may be set in configuration. Anything
@@ -68,6 +78,7 @@ _POLICY_OPTIONS: Dict[str, Tuple[str, ...]] = {
     POLICY_FIFO: ("batch_interval",),
     POLICY_ROUND_ROBIN: ("time_slice",),
     POLICY_PRIORITY: ("aging_interval", "default_priority"),
+    POLICY_FAIR_SHARE: ("default_weight", "poll_interval"),
 }
 
 #: Names of the queue getters a scheduler is constructed with.
@@ -224,6 +235,11 @@ def create_scheduler(policy_name: str, **params: Any) -> Any:
         from .priority_scheduler import PriorityScheduler
 
         return PriorityScheduler(**params)
+
+    if policy == POLICY_FAIR_SHARE:
+        from .fair_share_scheduler import FairShareScheduler
+
+        return FairShareScheduler(**params)
 
     # Unreachable: normalise_policy_name only returns canonical names.
     raise ValueError(f"No builder registered for policy {policy!r}.")

@@ -134,6 +134,8 @@ scheduler:
   #   round_robin - each syscall gets a fixed time slice
   #   priority    - highest priority first, with aging so low-priority agents
   #                 cannot be starved (see docs/scheduling/priority_scheduling.md)
+  #   fair_share  - weighted stride scheduling: each agent gets a share of the
+  #                 LLM proportional to its weight (alias stride)
   # When omitted, the previous implicit choice is kept: round_robin if
   # llms.use_context_manager is true, otherwise fifo. Aliases fcfs, rr and
   # prio are also accepted.
@@ -156,6 +158,13 @@ scheduler:
     aging_interval: 5
     # Level assumed when a syscall carries no priority: high | normal | low.
     default_priority: "normal"
+
+  # Options for `policy: fair_share`
+  fair_share:
+    # Stride weight given to an agent that does not declare one (must be > 0).
+    default_weight: 1.0
+    # Seconds the dispatcher sleeps when no request is ready.
+    poll_interval: 0.05
 
 agent_factory:
   log_mode: "console" # choose from [console, file]
