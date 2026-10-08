@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from prompt_toolkit import PromptSession
@@ -71,11 +72,40 @@ def default_server() -> str:
         return DEFAULT_SERVER
 
 
-def mount_agent_root(agent_name: str, root_dir: str) -> None:
-    """Mount the semantic file system for this agent, if Cerebrum is available."""
+def mount_agent_root(
+    agent_name: str,
+    root_dir: str,
+    server: str = DEFAULT_SERVER,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+) -> None:
+    """Mount the semantic file system for this agent, if Cerebrum is available.
+
+    Args:
+        agent_name: Identity the storage mount is registered under.
+        root_dir: Absolute path to mount as the agent's root.
+        server: Kernel URL to send the mount request to.  When omitted the
+            module default is used, but callers that already know the
+            kernel URL should pass it explicitly so the mount always
+            reaches the right server.
+        retries: Number of attempts before giving up.
+        retry_delay: Seconds to wait between retries.
+    """
+    import urllib.error
     from cerebrum.storage.apis import mount
 
-    mount(agent_name=agent_name, root_dir=root_dir)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            mount(agent_name=agent_name, root_dir=root_dir, base_url=server)
+            return  # success
+        except (urllib.error.HTTPError, ConnectionError, OSError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(retry_delay)
+    # All retries exhausted -- re-raise the last error so the caller
+    # can report it.
+    raise last_error  # type: ignore[misc]
 
 
 class AIOSTerminal:
@@ -466,6 +496,7 @@ class AIOSTerminal:
         )
 
         root_dir = self.current_dir + "/root"
+        do_mount = False
 
         while True:
             mount_choice = self.session.prompt(
@@ -483,25 +514,27 @@ class AIOSTerminal:
                         extra_str="Enter the absolute path of the directory to mount: "
                     )
                 )
+                do_mount = True
                 break
             if mount_choice == "n":
                 break
             self.console.print("[red]Invalid input. Please enter 'y' or 'n'.[/red]")
 
-        try:
-            mount_agent_root(self.agent_name, root_dir)
-            self.console.print(
-                Text(
-                    f"The semantic file system is mounted at {root_dir}",
-                    style="bold cyan",
+        if do_mount:
+            try:
+                mount_agent_root(self.agent_name, root_dir, server=self.server)
+                self.console.print(
+                    Text(
+                        f"The semantic file system is mounted at {root_dir}",
+                        style="bold cyan",
+                    )
                 )
-            )
-        except Exception as error:
-            # Chat still works against a kernel whose storage mount failed, so
-            # report it and carry on rather than refusing to start.
-            self.console.print(
-                f"[yellow]File system not mounted ({error}); chat is unaffected[/yellow]"
-            )
+            except Exception as error:
+                # Chat still works against a kernel whose storage mount failed, so
+                # report it and carry on rather than refusing to start.
+                self.console.print(
+                    f"[yellow]File system not mounted ({error}); chat is unaffected[/yellow]"
+                )
 
         while True:
             try:
